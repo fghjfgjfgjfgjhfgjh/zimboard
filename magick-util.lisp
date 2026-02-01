@@ -19,14 +19,6 @@
 ;          (progn ,body)
 ;          (destroy-wand ,name)))))
 
-; (defun create-wand (buf)
-;   nil
-;   )
-
-; (defun destroy-wand (wand)
-;   nil
-;   )
-
 (defun make-clean-blob (buf)
   (declare (type (simple-array (unsigned-byte 8)) buf))
   (cffi:with-foreign-objects

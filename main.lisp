@@ -1,7 +1,8 @@
 (defpackage #:zimboard
   (:use
     #:cl
-    #:clack #:lack #:cl-who
+    #:clack #:lack
+    #:cl-who
     #:sqlite
     #:flexi-streams
     #:md5
@@ -35,26 +36,15 @@
         unless (table-exists-p db (car i))
         do (sqlite:execute-non-query db (cdr i))))
 
-; (defun post-text-message (txt &key db1 img) ;; TODO add filename
-;   (let ((db (if db1 db1 (sqlite:connect ":memory:"))))
-;     (sqlite:execute-non-query db "insert into text_line_posts (msg, imageid) values (?, ?)" txt (if img img 0))))
-
 (defvar *mem-db-initialized* nil)
 (defvar *max-session-age* 2592000)
 
 ;; TODO is this safe?
 (defvar *z-random-state* (make-random-state t))
 
-(defun startup-mem-db ()
-  (init-database *mem-db*)
-  ; (post-text-message "Welcome to the server" :db1 *mem-db*)
-  ; (post-text-message "test test test" :db1 *mem-db*)
-  ; (post-text-message "this text should be rendered on the page" :db1 *mem-db*)
-  )
-
 (unless *mem-db-initialized*
   (setf *mem-db-initialized* t)
-  (startup-mem-db))
+  (init-database *mem-db*))
 
 ;; NOTE that this runs under the assumption a..z and likes are sequential in the codespace
 (defun latin-char-p (c)
@@ -85,6 +75,7 @@
           (setf (elt s (+ ix ix 1)) (int-to-hex (ash i -4))))
         finally (return s)))
 
+;; TODO should I have used a fill pointer here?
 (defun read-till-rn (r)
   (loop with a = (make-array 1024
                              :adjustable t
@@ -102,7 +93,7 @@
         finally (return (adjust-array a l))))
 
 (defun arr-int-equal-till-newline (a b &optional n)
-  (let ((nx (if n n (length a))))
+  (let ((nx (or n (length a))))
     (if (<= nx (length b))
       (loop for i from 0 below nx
             until (= 13 (aref a i))
@@ -187,6 +178,7 @@
         (labels ((finish
                    (pos)
                    ;; TODO is this use of intern correct and safe?
+                   ;;      probably change to make-table and a hash table with test #'equal
                    (if cur-name
                      (setf r `(,(subseq l cpos pos) ,(intern (string-upcase cur-name) :keyword) . ,r)
                            cur-name nil)
@@ -205,7 +197,6 @@
   (cl-who:with-html-output (p)
     (:form :method "post" :enctype "multipart/form-data" ;; any other kind won't let me have file transmission
            :action "/id"
-      ; (:input :type "text" :name "msg" :placeholder "enter text")
       (:input :type "file" :name "image")
       (:textarea :name "tags" :style "display: block"
                  :placeholder "post tags (separate with commas or whitespace)")
@@ -215,10 +206,6 @@
   (cl-who:with-html-output
     (p)
     (:nav :id "page-navbar"
-          ; (:img :id "lisp-logo"
-          ;       :alt "May contain trace amounts of LISP"
-          ;       :src "/imgs/lisplogo_warning_128.png")
-          ; (:span :id "site-name" "ZImBoard")
           (:a :class "nav-link" :href "/" "Home")
           (:a :class "nav-link" :href "/search" "Search")
           (:a :class "nav-link" :href "/post" "Make a post")
@@ -333,17 +320,12 @@
 
 (defun page-post-create (args)
   (let ((parsed (parse-multipart (getf args :body)))
-        ; (msg-text nil)
         (image-body nil)
         (tags nil)
         (cur-id nil))
     (dolist (i parsed)
       (let ((x (multipart-pull-out-name (getf i :headers))))
         (cond
-          ; ((equalp "\"msg\"" x)
-          ;  (setf msg-text (flexi-streams:octets-to-string
-          ;                   (getf i :body)
-          ;                   :external-format :utf-8)))
           ((equalp "\"image\"" x)
            (setf image-body (getf i :body)))
           ((equalp "\"tags\"" x)
@@ -383,9 +365,7 @@
                     *mem-db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
                     (tagname-to-id i *mem-db* :create-if-missing t) cur-id)))
           (sqlite:execute-non-query
-            *mem-db* "update posts set complete=1 where id=?" cur-id)))
-      ;(post-text-message msg-text :img (if cur-id cur-id 0) :db1 *mem-db*)
-      ))
+            *mem-db* "update posts set complete=1 where id=?" cur-id)))))
   (list 303 '(:content-type "text/plain" :location "/")
         '("sending image")))
 
@@ -731,8 +711,6 @@
          (meth (getf env :request-method))
          (cookie (gethash "cookie" (getf env :headers)))
          (cookie-parsed (parse-simple cookie)))
-    ; (declare (ignorable query))
-    ; (format t "~A~%" (get-cookie-user cookie))
     (funcall (route meth path)
              (list :query query
                    :body body

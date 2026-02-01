@@ -2,7 +2,11 @@
   :description "Image board"
   :author "Dmytry Strakhal"
   :license "BSD 2-Clause"
-  :depends-on (#:clack #:lack #:cl-who #:sqlite #:flexi-streams #:md5 #:zimboard/magick-util)
+  :depends-on (#:hunchentoot
+               #:clack #:lack #:clack-handler-hunchentoot
+               #:trivial-mimes
+               #:trivial-rfc-1123
+               #:cl-who #:sqlite #:flexi-streams #:md5 #:zimboard/magick-util)
   :components
   ((:file "main")))
 
@@ -19,10 +23,3 @@
                     (apply next args)) 
   :components
   ((:file "magick-util")))
-
-; (defsystem "zimboard/stbi"
-;   :description "stb_image bindings"
-;   :author "Dmytry Strakhal"
-;   :license "BSD 2-Clause"
-;   :components
-;   ((:file "stbi")))
