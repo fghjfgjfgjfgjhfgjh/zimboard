@@ -1,5 +1,5 @@
 body {
-  background-color: darkcyan;
+	background-color: darkcyan;
 }
 
 #page-navbar {
@@ -60,6 +60,12 @@ body {
 	margin: 20px 0 0 0;
 }
 
+#post-list {
+	margin-top: 10px;
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
 input:invalid {
 	border-style: dashed;
 	border-color: red;
@@ -71,4 +77,37 @@ input:invalid {
 	border-style: solid;
 	border-color: red;
 	border-width: 1px;
+}
+
+.note {
+	background-color: lightblue;
+	width: 240px;
+	border-style: solid;
+	border-color: blue;
+	border-width: 1px;
+}
+
+.comments {
+	/* max-width: max(min(80em, 80%), 40%); */
+	max-width: 80em;
+}
+
+.comment-p {
+	width: 100%;
+	background-color: violet;
+	border-color: purple;
+	border-style: solid;
+	border-width: 1px;
+}
+
+.article-preview a {
+	display: flex;
+	flex-direction: column;
+}
+
+.article-preview a img {
+	margin: auto auto;
+}
+.article-preview a span {
+	margin: auto auto;
 }

@@ -1,7 +1,7 @@
 (defpackage #:zimboard
   (:use
     #:cl
-    #:clack #:lack
+    #:clack #:lack ;; TODO get rid of lack later. Maybe rewrite it to bare hunchentoot?
     #:cl-who
     #:sqlite
     #:flexi-streams
@@ -17,26 +17,37 @@
   '(("users" . "create table users (id integer primary key, name text, passwd text)")
     ;; A session is described by its identifier - a string of 32 alphanumeric characters
     ;; The expiration date is in standard UNIX time
-    ;; Currently, session expiration isn't implemented
+    ;; TODO Currently, session expiration isn't implemented
     ("sessions" . "create table sessions (id text primary key, expiration integer, user_id integer)")
-    ;; If a comment's parent is a negative number, it's a post; otherwise, it's another comment it's attached to
-    ;("comments" "create table comments (id integer primary key, parent integer, msg text)")
+    ("comments" . "create table comments (id integer primary key, in_post integer, parent_comment integer, msg text, user integer, date integer)")
     ("posts" . "create table posts (id integer primary key, md5 text, complete integer, creation_date integer, posted_by integer)")
     ("tags" . "create table tags (id integer primary key, name text)")
     ("tags_to_posts" . "create table tags_to_posts (tag_id integer, post_id integer)")))
 
-(defun table-exists-p (db name)
-  (loop with stmt = (sqlite:prepare-statement db "select name from sqlite_master where type='table' and name=?")
-        initially (sqlite:bind-parameter stmt 1 name)
-        while (sqlite:step-statement stmt)
-        thereis t))
+(defvar *table-indices*
+  '(("idx_tags_name" . "create index idx_tags_name on tags (name)")
+    ("idx_tags_id" . "create index idx_tags_id on tags (id)")
+    ("idx_tags_to_posts" . "create index idx_tags_to_posts on tags_to_posts (tag_id, post_id)")
+    ("idx_posts_to_tags" . "create index idx_posts_to_tags on tags_to_posts (post_id, tag_id)")
+    ("idx_comments_by_post" . "create index idx_comments_by_post on comments (in_post)")))
 
-(defun init-database (db) ;; TODO add filename, add force-overwrite flag
+(defun table-exists-p (db name)
+  (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
+
+(defun index-exists-p (db name)
+  (sqlite:execute-single db "select name from sqlite_master where type='index' and name=?" name))
+
+(defun init-database (db)
   (loop for i in *tables*
         unless (table-exists-p db (car i))
+        do (sqlite:execute-non-query db (cdr i)))
+  (loop for i in *table-indices*
+        unless (index-exists-p db (car i))
         do (sqlite:execute-non-query db (cdr i))))
 
 (defvar *mem-db-initialized* nil)
+;; The session cookie only lives a month.
+;; NOTE that this can become a per-user setting in the future
 (defvar *max-session-age* 2592000)
 
 ;; TODO is this safe?
@@ -45,6 +56,10 @@
 (unless *mem-db-initialized*
   (setf *mem-db-initialized* t)
   (init-database *mem-db*))
+
+;; NOTE that this function is mainly for interactive/admin use
+(defun clear-uncomplete-posts ()
+  (sqlite:execute-non-query *mem-db* "delete from posts where complete=0"))
 
 ;; NOTE that this runs under the assumption a..z and likes are sequential in the codespace
 (defun latin-char-p (c)
@@ -65,6 +80,13 @@
     (code-char (+ 48 n))
     (code-char (+ 87 n))))
 
+(defun hex-to-int (c &optional (default -1))
+  (cond
+    ((numer-char-p c) (- (char-code c) (char-code #\0)))
+    ((<= (char-code #\A) (char-code c) (char-code #\F))
+     (+ 10 (- (char-code c) (char-code #\A))))
+    (t default)))
+
 (defun array-to-hex (a)
   "Convert a byte array into a hex string"
   (loop with s = (make-string (* 2 (length a)))
@@ -75,7 +97,33 @@
           (setf (elt s (+ ix ix 1)) (int-to-hex (ash i -4))))
         finally (return s)))
 
-;; TODO should I have used a fill pointer here?
+
+(defun percent-decode (str)
+  (with-output-to-string (result)
+    (let ((i 0)
+          (len (length str)))
+      (loop while (< i len) do
+            (let ((c (char str i)))
+              (cond
+                ((char= #\% c)
+                 (if (< (+ i 2) len)
+                   (let ((c1 (hex-to-int (char str (+ 1 i)) nil))
+                         (c2 (hex-to-int (char str (+ 2 i)) nil)))
+                     (when (and c1 c2)
+                       (write-char (code-char (+ c2 (* 16 c1))) result))
+                     (incf i 3))
+                   (incf i)))
+                ((char= #\+ c)
+                 (write-char #\Space result)
+                 (incf i))
+                (t
+                  (write-char c result)
+                  (incf i))))))))
+
+; (defvar *percent-non-encoded* "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~.")
+;TODO (defun percent-encode (string))
+
+;; TODO should have I used a fill pointer here?
 (defun read-till-rn (r)
   (loop with a = (make-array 1024
                              :adjustable t
@@ -167,31 +215,83 @@
                              (vector-push-extend i (getf (car parts) :body)))))))))
       (nreverse parts))))
 
-(defun parse-simple (request-body)
+(defun parse-simple (request-body &optional (sep #\&))
   (let ((l (typecase request-body
              (null nil)
              (string request-body)
              (t (read-line request-body nil)))))
     ;; NOTE that such a condition is redudant. (length nil) is zero
     (if (and l (not (zerop (length l))))
-      (let ((r nil) (cur-name nil) (cpos 0))
+      (let ((r (make-hash-table :test #'equal)) (cur-name nil) (cpos 0))
         (labels ((finish
                    (pos)
-                   ;; TODO is this use of intern correct and safe?
-                   ;;      probably change to make-table and a hash table with test #'equal
                    (if cur-name
-                     (setf r `(,(subseq l cpos pos) ,(intern (string-upcase cur-name) :keyword) . ,r)
+                     (setf (gethash cur-name r) (subseq l cpos pos)
                            cur-name nil)
-                     (setf r `(nil ,(intern (string-upcase (subseq l cpos pos)) :keyword) . ,r)))))
+                     (setf (gethash (subseq l cpos pos) r) nil))))
           (loop for i across l
                 for ix from 0 do
-                (case i
-                  (#\& (finish ix) (setf cpos (1+ ix)))
-                  (#\= (unless cur-name
+                (cond
+                  ((and (white-char-p i) (= cpos ix))
+                   (incf cpos))
+                  ((eql i sep) (finish ix) (setf cpos (1+ ix)))
+                  ((eql i #\=) (unless cur-name
                          (setf cur-name (subseq l cpos ix)
                                cpos (1+ ix))))
-                  (otherwise nil))
-                finally (progn (finish (length l)) (return (nreverse r)))))))))
+                  (t nil))
+                finally (progn (finish (length l)) (return r)))))
+      (make-hash-table :test #'equal))))
+
+(defmacro simple-page (head &rest body)
+  (declare (type list head))
+  (let ((status (getf head :status 200))
+        (use-navbar (getf head :use-navbar t))
+        (output (getf head :output))
+        (args (getf head :args))
+        (title (getf head :title)))
+    (declare (type symbol args))
+    (declare (type symbol output))
+    `(list
+       ,status '(:content-type "text/html")
+       (list
+         (cl-who:with-html-output-to-string
+           (,output nil :prologue t)
+           (:html
+             (:head (:title ,title)
+                    (:link :rel "stylesheet"
+                           :href "/static/style.css"))
+             ,(if use-navbar
+                `(:body (page-navbar ,output (first (getf ,args :deduced-user)))
+                        ,(nconc (list :div :id "main")
+                                body))
+                (cons :body body))))))))
+
+(defun page-error-div (output str)
+  (cl-who:with-html-output
+    (output)
+    (:div :class "error"
+          (:span (format output "~A" str)))))
+
+(defparameter *page-error-kinds*
+  '(("i" . "Invalid username")
+    ("x" . "User already exists")
+    ("n" . "Passwords do not match")
+    ("lx" . "User doesn't exist")
+    ("lp" . "Password incorrect")
+    ("pi" . "Failed to parse image")
+    ("ps" . "Failed to write file: such hash already exists")
+    ("pp" . "Failed to write the preview file")
+    ("pn" . "No image file specified?")
+    ("pm" . "Must be logged in in order to post")
+    ("cm" . "Must be logged in in order to comment")
+    ("ci" . "Invalid post id")
+    ("em" . "Must be logged in in order to edit tags")
+    ("ej" . "Stop sending junk to the server, dumbass")))
+
+(defun page-error-case (output error-kind)
+  (loop for i in *page-error-kinds*
+        when (string-equal (car i) error-kind)
+        return (page-error-div output (cdr i))))
 
 (defun page-post-input (p)
   (cl-who:with-html-output (p)
@@ -221,27 +321,17 @@
               (:a :class "nav-link" :href "/register" "Register")
               (:a :class "nav-link" :href "/login" "Login"))))))
 
-(defun page-list-posts (args)
+(defun page-home (args)
   (let ((start-time (get-internal-real-time)))
-    (list
-      200 '(:content-type "text/html")
-      (list
-        (cl-who:with-html-output-to-string
-          (output nil :prologue t)
-          (:html
-            (:head (:title "zimboard")
-                   (:link :rel "stylesheet"
-                          :href "/static/style.css"))
-            (:body
-              (page-navbar output (getf args :deduced-user))
-              (:div :id "main"
-                    (:p "This is a simple imageboard, providing tag search. The 'search' page may be of interest.")
-                    (:img :alt "May contain trace amounts of LISP"
-                          :src "/imgs/lisplogo_warning_128.png")
-                    (format
-                      output "<p>Page generated in ~,5F</p>"
-                      (/ (- (get-internal-real-time) start-time)
-                         internal-time-units-per-second))))))))))
+    (simple-page
+      (:title "Zimboard" :args args :output output)
+      (:p "This is a simple imageboard, providing tag search. The 'search' page may be of interest.")
+      (:img :alt "May contain trace amounts of LISP"
+            :src "/imgs/lisplogo_warning_128.png")
+      (format
+        output "<p>Page generated in ~,5F</p>"
+        (/ (- (get-internal-real-time) start-time)
+           internal-time-units-per-second)))))
 
 (defun content-disposition-name (p)
   (loop with state = 1
@@ -264,7 +354,7 @@
           (2 (cond
                ((eql #\; i) (setf (fill-pointer this-name) 0))
                ((eql #\= i)
-                (when (equalp this-name "name")
+                (when (string-equal this-name "name")
                   (setf state 3)))
                ((not (eql #\Space i)) (vector-push i this-name))))
           (3 (cond
@@ -293,15 +383,11 @@
           (subseq hash 4)))
 
 (defun tagname-to-id (name db &key create-if-missing)
-  (or
-    (loop with stmt = (sqlite:prepare-statement db "select id from tags where name=?")
-          initially (sqlite:bind-parameter stmt 1 name)
-          while (sqlite:step-statement stmt)
-          return (sqlite:statement-column-value stmt 0))
-    (when create-if-missing
-      (sqlite:execute-non-query
-        db "insert into tags (name) values (?)" name)
-      (sqlite:last-insert-rowid db))))
+  (or (sqlite:execute-single db "select id from tags where name=?" name)
+      (when create-if-missing
+        (sqlite:execute-non-query
+          db "insert into tags (name) values (?)" name)
+        (sqlite:last-insert-rowid db))))
 
 (defun parse-tags (s)
   (let ((r nil) (cpos 0))
@@ -313,8 +399,8 @@
       (loop for i across s
             for ix from 0 do
             (when (or (white-char-p i)
-                       (eql i #\,))
-               (finish ix))
+                      (eql i #\,))
+              (finish ix))
             finally (progn (finish (length s))
                            (return (nreverse r)))))))
 
@@ -322,24 +408,34 @@
   (let ((parsed (parse-multipart (getf args :body)))
         (image-body nil)
         (tags nil)
-        (cur-id nil))
+        (cur-id nil)
+        (user-id (username-to-id (first (getf args :deduced-user)))))
     (dolist (i parsed)
       (let ((x (multipart-pull-out-name (getf i :headers))))
         (cond
-          ((equalp "\"image\"" x)
+          ((string-equal "\"image\"" x)
            (setf image-body (getf i :body)))
-          ((equalp "\"tags\"" x)
+          ((string-equal "\"tags\"" x)
            (setf tags (getf i :body))))))
-    (when (and image-body
-               (not (zerop (length image-body))))
-      (let* ((clean-body (magick-util:make-clean-blob (copy-seq image-body)))
+    (labels ((l-error
+               (text)
+               (return-from
+                 page-post-create
+                 `(303 (:content-type "text/plain"
+                        :location ,(format nil "/post?e=~A" text))
+                   (format nil "ERROR: ~A" text)))))
+      (unless user-id
+        (l-error "pm"))
+      (when (zerop (length image-body))
+        (l-error "pn"))
+      (let* ((clean-body (or (magick-util:make-clean-blob (copy-seq image-body))
+                             (l-error "pi")))
              (hash (array-to-hex (md5:md5sum-sequence clean-body))))
-        ; (format t "calculated MD5: ~A~%" hash)
         ;; Was seemingly breaking on hashes starting with [digits]e... because of automatic type converison
         ;; FIXed by changing the type from non-existant 'string' to 'text'
         (sqlite:execute-non-query
           *mem-db* "insert into posts (complete, md5, creation_date, posted_by) values (0, ?, ?, ?)"
-          hash (get-universal-time) (getf args :deduced-user))
+          hash (get-universal-time) user-id)
         (setf cur-id (sqlite:last-insert-rowid *mem-db*))
         (let ((orig-name (format nil "./imgs/~A" (image-orig-path hash))))
           (ensure-directories-exist (directory-namestring orig-name))
@@ -352,14 +448,14 @@
               (orig-f
                 (loop for i across clean-body
                       do (write-byte i orig-f)))
-              (t "Failed to write file: such hash already exists")))
+              (t (l-error "ps"))))
           (let ((preview-name (format nil "./imgs/~A" (image-preview-path cur-id))))
             (ensure-directories-exist (directory-namestring preview-name))
             (unless (magick-util:make-thumbnail
                       clean-body
                       128 128
                       preview-name)
-              "Failed to write the preview file")
+              (l-error "pp"))
             (loop for i in (parse-tags (flexi-streams:octets-to-string tags)) do
                   (sqlite:execute-non-query
                     *mem-db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
@@ -370,95 +466,46 @@
         '("sending image")))
 
 (defun page-post-form (args)
-  (list
-    200 '(:content-type "text/html")
-    (list
-      (cl-who:with-html-output-to-string
-        (output nil :prologue t)
-        (:html
-          (:head (:title "Make a post")
-                 (:link :rel "stylesheet"
-                        :href "/static/style.css"))
-          (:body
-            (page-navbar output (getf args :deduced-user))
-            (:div :id "main"
-                  (page-post-input output))))))))
-
-(defun page-error-div (output str)
-  (cl-who:with-html-output
-    (output)
-    (:div :class "error"
-          (:span (format output "~A" str)))))
-
-(defun page-error-case (output error-kind)
-  (cond
-    ((not error-kind) nil)
-    ((equalp error-kind "i")
-     (page-error-div output "Invalid username"))
-    ((equalp error-kind "x")
-     (page-error-div output "User already exists"))
-    ((equalp error-kind "n")
-     (page-error-div output "Passwords do not match"))
-    ((equalp error-kind "lx")
-     (page-error-div output "User doesn't exist"))
-    ((equalp error-kind "lp")
-     (page-error-div output "Password incorrect"))))
+  (simple-page
+    (:title "Make a post" :args args :output output)
+    (page-error-case output (gethash "e" (getf args :query-parsed)))
+    (page-post-input output)))
 
 (defun page-register (args)
   (let ((qp (parse-simple (getf args :query))))
-    (list
-      200 '(:content-type "text/html")
-      (list
-        (cl-who:with-html-output-to-string
-          (output nil :prologue t)
-          (:html
-            (:head (:title "Register")
-                   (:link :rel "stylesheet"
-                          :href "/static/style.css"))
-            (:body
-              (page-navbar output (getf args :deduced-user))
-              (:div :id "main"
-                    (page-error-case output (getf qp :e))
-                    (:form :method "post" :action "/user"
-                           (:table
-                             (:tr
-                               (:td (:label :for "un" "Username"))
-                               (:td (:input :name "username" :id "un" :type "text" :pattern "([A-Za-z0-9_-.])+")))
-                             (:tr
-                               (:td (:label :for "paswd" "Password"))
-                               (:td (:input :name "password" :id "paswd" :type "password" :required "")))
-                             (:tr
-                               (:td (:label :for "paswd1" "Password again"))
-                               (:td (:input :name "password1" :id "paswd1" :type "password" :required "")))
-                             (:tfoot (:td (:input :type "submit" :value "Register account")))))))))))))
+    (simple-page
+      (:title "Register" :args args :output output)
+      (page-error-case output (gethash "e" qp))
+      (:form :method "post" :action "/user"
+             (:table
+               (:tr
+                 (:td (:label :for "un" "Username"))
+                 (:td (:input :name "username" :id "un" :type "text" :pattern "([A-Za-z0-9_-.])+")))
+               (:tr
+                 (:td (:label :for "paswd" "Password"))
+                 (:td (:input :name "password" :id "paswd" :type "password" :required "")))
+               (:tr
+                 (:td (:label :for "paswd1" "Password again"))
+                 (:td (:input :name "password1" :id "paswd1" :type "password" :required "")))
+               (:tfoot (:td (:input :type "submit" :value "Register account"))))))))
 
 (defun page-login (args)
   (let ((qp (parse-simple (getf args :query))))
-    (list
-      200 '(:content-type "text/html")
-      (list
-        (cl-who:with-html-output-to-string
-          (output nil :prologue t)
-          (:html
-            (:head (:title "Login")
-                   (:link :rel "stylesheet"
-                          :href "/static/style.css"))
-            (:body
-              (page-navbar output (getf args :deduced-user))
-              (:div :id "main"
-                    (page-error-case output (getf qp :e))
-                    (:form :method "post" :action "/session"
-                           (:table
-                             (:tr
-                               (:td (:label :for "un" "Username"))
-                               (:td (:input :name "username" :id "un" :type "text" :pattern "([A-Za-z0-9_-.])+")))
-                             (:tr
-                               (:td (:label :for "paswd" "Password"))
-                               (:td (:input :name "Password" :id "paswd" :type "password")))
-                             (:tfoot
-                               (:td (:input :type "submit" :value "Log in")))))))))))))
+    (simple-page
+      (:title "Login" :args args :output output)
+      (page-error-case output (gethash "e" qp))
+      (:form :method "post" :action "/session"
+             (:table
+               (:tr
+                 (:td (:label :for "un" "Username"))
+                 (:td (:input :name "username" :id "un" :type "text" :pattern "([A-Za-z0-9_-.])+")))
+               (:tr
+                 (:td (:label :for "paswd" "password"))
+                 (:td (:input :name "password" :id "paswd" :type "password")))
+               (:tfoot
+                 (:td (:input :type "submit" :value "Log in"))))))))
 
-(defun parse-search (s)
+(defun parse-search-query (s)
   (let ((r nil) (cpos 0))
     (labels ((finish
                (pos)
@@ -474,24 +521,52 @@
 (defun tag-count (tag-id)
   (sqlite:execute-single *mem-db* "select count(*) from tags_to_posts where post_id=?" tag-id))
 
+(defun collect-post-tags (post-id)
+  ;; TODO improve perf if needed
+  (mapcar #'car (sqlite:execute-to-list
+                  *mem-db* "select tags.name from tags_to_posts inner join tags where tags_to_posts.post_id=? and tags.id=tags_to_posts.tag_id" post-id)))
+
+(defun print-date (d)
+  (multiple-value-bind (second minute hour date month year day daylight-p zone)
+    (decode-universal-time d 0)
+    (declare (ignore zone daylight-p day))
+    (format nil "~D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D by UTC" year month date hour minute second)))
+
 (defun page-display-post (p post-id)
   (multiple-value-bind (id md5 date by)
     (sqlite:execute-one-row-m-v
       *mem-db* "select id, md5, creation_date, posted_by from posts where id=?" post-id)
     (when id
-      (format p "<p>id:~A md5:~A date:~A posted_by:~A</p><img src=\"/imgs/~A\">"
-              id md5 date
+      (format p "<p>id:~D md5:~A date:(~A) posted_by:~A tags:~{~S~^, ~}</p><img src=\"/imgs/~A\">"
+              id md5 (print-date date)
               (id-to-username by)
+              (collect-post-tags post-id)
               (image-orig-path md5)))))
 
+(defun page-display-comments (p post-id)
+  (loop with stmt = (sqlite:prepare-statement *mem-db* "select id, user, msg, date from comments where in_post=?")
+        initially (sqlite:bind-parameter stmt 1 post-id)
+        while (sqlite:step-statement stmt)
+        do (format p "<p class=\"comment-p\">comment id: ~D by user ~D:~A at ~A<br>~A</p>"
+                   (sqlite:statement-column-value stmt 0)
+                   (sqlite:statement-column-value stmt 1)
+                   (id-to-username (sqlite:statement-column-value stmt 1))
+                   (print-date (sqlite:statement-column-value stmt 3))
+                   (cl-who:escape-string (sqlite:statement-column-value stmt 2)))
+        finally (sqlite:finalize-statement stmt)))
+
+(defun page-display-post-preview (p post-id)
+  (format p "<article class=\"article-preview\"><a href=\"/id/~D\"><img src=\"/imgs/~A\"><span>post #~A</span></a></article>"
+          post-id (image-preview-path post-id) post-id))
+
 (defun post-matches-tag-p (post-id tag-id)
-  (sqlite:execute-single "select post_id from tags_to_posts where post_id=? and tag_id=?" post-id tag-id))
+  (sqlite:execute-single *mem-db* "select post_id from tags_to_posts where post_id=? and tag_id=?" post-id tag-id))
 
 (defun post-matches-tags-p (id x)
   (loop for i in x always (post-matches-tag-p id i)))
 
 (defun page-search-list (p s)
-  (let ((x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) (parse-search s))))
+  (let ((x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) (parse-search-query s))))
     (let ((ctag nil))
       (loop with ccount = 100000000
             for i in x do
@@ -500,98 +575,77 @@
                 (setf ccount y
                       ctag i))))
       (when ctag
-        (loop with stmt = (sqlite:prepare-statement *mem-db* "select posts.id from posts inner join tags_to_posts where tags_to_posts.post_id=posts.id and tags_to_posts.tag_id=?")
+        (loop with stmt = (sqlite:prepare-statement *mem-db* "select posts.id from posts inner join tags_to_posts where tags_to_posts.post_id=posts.id and tags_to_posts.tag_id=? order by posts.creation_date desc")
               initially (sqlite:bind-parameter stmt 1 ctag)
               while (sqlite:step-statement stmt)
               when (post-matches-tags-p (sqlite:statement-column-value stmt 0) (cdr x))
-              do (page-display-post p (sqlite:statement-column-value stmt 0)))))))
+              do (page-display-post-preview p (sqlite:statement-column-value stmt 0))
+              finally (sqlite:finalize-statement stmt))))))
 
 (defun page-search (args)
-  (list
-    200 '(:content-type "text/html")
-    (list
-      (cl-who:with-html-output-to-string 
-        (output nil :prologue t)
-        (:html
-          (:head (:title "Search")
-                 (:link :rel "stylesheet"
-                        :href "/static/style.css"))
-          (:body
-            (page-navbar output (getf args :deduced-user))
-            (:div :id "main"
-                  (:form :action "/search"
-                         (:label :for "s" "Search string: ")
-                         (:input :id "s" :name "s" :type "text" :placeholder "empty"))
-                  (:ul
-                    (let ((s (getf (getf args :query-parsed) :s)))
-                      (if s
-                        (page-search-list output s)
-                        (loop with stmt = (sqlite:prepare-statement *mem-db* "select id, md5 from posts order by creation_date desc limit 10")
-                              while (sqlite:step-statement stmt)
-                              do (format output "<li><img src=\"/imgs/~A\"><a href=\"/id?s=~A\">post #~A</li></li>"
-                                         (image-orig-path (sqlite:statement-column-value stmt 1))
-                                         (sqlite:statement-column-value stmt 0)
-                                         (sqlite:statement-column-value stmt 0)))))))))))))
+  (let ((s (gethash "s" (getf args :query-parsed) "")))
+    (simple-page
+      (:title "Search" :args args :output output)
+      (:form :action "/search"
+             (:label :for "s" "Search string: ")
+             (:input :id "s" :name "s" :type "text" :placeholder "empty" :value s))
+      (:div :id "post-list"
+            (if (not (zerop (length s)))
+              (page-search-list output s)
+              (loop with stmt = (sqlite:prepare-statement *mem-db* "select id from posts order by creation_date desc limit 10")
+                    while (sqlite:step-statement stmt)
+                    do (page-display-post-preview output (sqlite:statement-column-value stmt 0))
+                    finally (sqlite:finalize-statement stmt)))))))
 
 (defun valid-username-p (name)
-  (loop for i across name
-        ;; NOTE that arbitrary Unicode is not allowed in usernames.
-        ;; only Latin script, numerics, and a few other symbols
-        always (or (latin-char-p i)
-                   (numer-char-p i)
-                   (eql #\. i)
-                   (eql #\_ i)
-                   (eql #\- i))))
+  "Username is valid whenever it is at least 3 characters short and
+consists only of Latin script, numerics, and any of [._-]"
+  (and (>= (length name) 3)
+       (loop for i across name
+             always (or (latin-char-p i)
+                        (numer-char-p i)
+                        (eql #\. i)
+                        (eql #\_ i)
+                        (eql #\- i)))))
 
 (defun invalid-username-p (name)
   (not (valid-username-p name)))
 
-(defun username-exists-p (name)
-  (loop with stmt = (sqlite:prepare-statement *mem-db* "select id from users where name=?")
-        initially (sqlite:bind-parameter stmt 1 name)
-        while (sqlite:step-statement stmt)
-        thereis t))
+(defun username-to-id (name)
+  (sqlite:execute-single *mem-db* "select id from users where name=?" name))
+
+(defun id-to-username (id)
+  (when id
+    (sqlite:execute-single *mem-db* "select name from users where id=?" id)))
 
 (defun page-post-user (args)
   (let ((c (parse-simple (getf args :body))))
     (cond
-      ((invalid-username-p (getf c :username))
+      ((invalid-username-p (gethash "username" c))
        (list 303 '(:content-type "text/plain" :location "/register?e=i")
              '("Invalid username")))
-      ((username-exists-p (getf c :username))
+      ((username-to-id (gethash "username" c))
        (list 303 '(:content-type "text/plain" :location "/register?e=x")
              '("Username already exists")))
-      ((not (equal (getf c :password)
-                   (getf c :password1)))
+      ((not (string= (gethash "password" c)
+                     (gethash "password1" c)))
        (list 303 '(:content-type "text/plain" :location "/register?e=n")
              '("Passwords not equal")))
       (t
         (sqlite:execute-non-query *mem-db* "insert into users (name, passwd) values (?, ?)"
                                   ;; TODO make this SHA256
-                                  (getf c :username) (array-to-hex (md5:md5sum-sequence (getf c :password))))
-        (list
-          200 '(content-type "text/html")
-          (list
-            (cl-who:with-html-output-to-string
-              (output nil :prologue t)
-              (:html
-                (:head (:title "Account registered")
-                       (:link :rel "stylesheet"
-                              :href "/static/style.css"))
-                (:body
-                  (page-navbar output (getf args :deduced-user))
-                  (:div :id "main"
-                        (:p (format output "Account (~A) succesfully registered" (getf c :username)))))))))))))
+                                  (gethash "username" c) (array-to-hex (md5:md5sum-sequence (gethash "password" c))))
+        (simple-page
+          (:title "Account registered" :args args :output output)
+          (:p (format output "Account (~A) succesfully registered" (gethash "username" c))))))))
 
 (defun password-match-p (username password)
   ;; TODO replace md5 with SHA256
-  (loop with phash = (array-to-hex (md5:md5sum-sequence password))
-        with stmt = (sqlite:prepare-statement *mem-db* "select 1 from users where name=? and passwd=?")
-        initially (progn
-                    (sqlite:bind-parameter stmt 1 username)
-                    (sqlite:bind-parameter stmt 2 phash))
-        while (sqlite:step-statement stmt)
-        thereis t))
+  (if (sqlite:execute-single
+        *mem-db* "select 1 from users where name=? and passwd=?"
+        username
+        (array-to-hex (md5:md5sum-sequence password)))
+    t))
 
 (defvar base64-alphabet "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")
 (assert (= 64 (length base64-alphabet)))
@@ -610,24 +664,10 @@
                     r (+ *max-session-age* (get-universal-time)) user-id)
                   (return r))))
 
-(defun username-to-id (name)
-  (loop with stmt = (sqlite:prepare-statement
-                      *mem-db*
-                      "select id from users where name=?")
-        initially (sqlite:bind-parameter stmt 1 name)
-        while (sqlite:step-statement stmt)
-        return (sqlite:statement-column-value stmt 0)))
-
-(defun id-to-username (id)
-  (when id
-    (sqlite:execute-single *mem-db* "select name from users where id=?" id)))
-
 (defun get-cookie-user (cookie-parsed)
-  (loop with stmt = (sqlite:prepare-statement *mem-db* "select users.name, users.id from sessions inner join users where sessions.id=? and users.id=sessions.user_id")
-        initially (sqlite:bind-parameter stmt 1 (getf cookie-parsed :session))
-        while (sqlite:step-statement stmt)
-        return (values (sqlite:statement-column-value stmt 0)
-                       (sqlite:statement-column-value stmt 1))))
+  (sqlite:execute-one-row-m-v
+    *mem-db* "select users.name, users.id from sessions inner join users where sessions.id=? and users.id=sessions.user_id"
+    (gethash "session" cookie-parsed)))
 
 (defun delete-session-by-id (session)
   (sqlite:execute-non-query *mem-db* "delete from sessions where id=?" session))
@@ -637,14 +677,14 @@
     (delete-session-by-id (getf args :cookie-session)))
   (let ((qp (parse-simple (getf args :body))))
     (cond
-      ((not (username-exists-p (getf qp :username)))
+      ((not (username-to-id (gethash "username" qp)))
        (list 303 '(:content-type "text/plain" :location "/login?e=lx")))
-      ((not (password-match-p (getf qp :username) (getf qp :password)))
+      ((not (password-match-p (gethash "username" qp) (gethash "password" qp)))
        (list 303 '(:content-type "text/plain" :location "/login?e=lp")))
       (t
         (list 303 `(:content-type "text/plain"
-                    ;; Set cookies to expire after a month
-                    :set-cookie ,(format nil "session=~A; Max-Age=~D" (generate-session-cookie *mem-db* (username-to-id (getf qp :username))) *max-session-age*)
+                    :set-cookie ,(format nil "session=~A; Max-Age=~D"
+                                         (generate-session-cookie *mem-db* (username-to-id (gethash "username" qp))) *max-session-age*)
                     :location "/"))))))
 
 ;; Logging out is simple, just set the cookie to die and redirect back
@@ -654,24 +694,111 @@
     (delete-session-by-id (getf args :cookie-session)))
   `(303 (:content-type "text/plain"
          :set-cookie "session=; Max-Age=0"
-         :location ,(or (getf (parse-simple (getf args :query)) :goto) "/"))))
+         :location ,(or (gethash "goto" (parse-simple (getf args :query))) "/"))))
+
+(defun page-display-comment-form (p post-id)
+  (cl-who:with-html-output
+    (p)
+    (:form :method "post" :action (format nil "/id/~D/comment" post-id)
+           (:textarea :name "comment" :style "display: block"
+                      :placeholder "Comment text")
+           (:input :type "submit" :value "Send comment"))))
+
+(defun post-exists (id)
+  (sqlite:execute-single *mem-db* "select id from posts where id=?" id))
 
 (defun page-id (args)
-  (list
-    200 '(:content-type "text/html")
-    (list
-      (cl-who:with-html-output-to-string 
-        (output nil :prologue t)
-        (:html
-          (:head (:title "Id")
-                 (:link :rel "stylesheet"
-                        :href "/static/style.css"))
-          (:body
-            (page-navbar output (getf args :deduced-user))
-            (:div :id "main"
-                  (let ((c (getf (getf args :query-parsed) :s)))
-                    (when c
-                      (page-display-post output c))))))))))
+  (simple-page
+   (:title "Id" :args args :output output)
+   (let* ((id-s (second (getf args :path-s)))
+          (c (parse-integer (or id-s "") :junk-allowed t)))
+     (cond
+       ((and c (post-exists c))
+        (page-display-post output c)
+        (cl-who:with-html-output (output)
+          (:a :class "nav-link" :href (format nil "/id/~D/edit-tags" c) "Edit tags"))
+        (format output "<div class=\"comments\">")
+        (page-display-comments output c)
+        (format output "</div>")
+        (if (first (getf args :deduced-user))
+            (page-display-comment-form output c)
+            (cl-who:with-html-output (output)
+              (:p :class "note" "Only logged users can comment"))))
+       (t
+        (cl-who:with-html-output (output)
+          (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
+
+(defun page-id-edit-tags (args)
+  (simple-page
+    (:title "Edit tags" :args args :output output)
+    (let* ((id-s (second (getf args :path-s)))
+           (c (parse-integer (or id-s "") :junk-allowed t)))
+      (cond
+        ((and c (post-exists c))
+         (page-display-post output c)
+         (if (first (getf args :deduced-user))
+           (cl-who:with-html-output (output)
+             (:form
+               :method "post" :action (format nil "/id/~D/edit-tags" c)
+               (:textarea
+                 :name "tags"
+                 :style "display: block"
+                 (format output "~{~A~^ ~}" (collect-post-tags c)))
+               (:input :type "submit" :name "submit" :value "Edit tags")))
+           (cl-who:with-html-output (output)
+             (:p :class "note" "Only logged users can edit post tags"))))
+        (t
+         (cl-who:with-html-output (output)
+           (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
+
+(defun page-id-post-tags (args)
+  ;; TODO log the edit
+  (let* ((id-s (second (getf args :path-s)))
+         (c (parse-integer (or id-s "") :junk-allowed t))
+         (args-body-parsed (parse-simple (getf args :body)))
+         (tag-string (gethash "tags" args-body-parsed "")))
+    (labels ((l-error
+               (text)
+               (return-from
+                 page-id-post-tags
+                 `(303 (:location ,(format nil "/id/~D/edit-tags?e=~A" c text))
+                   (format nil "ERROR: ~A" text)))))
+    (cond
+      ((not (first (getf args :deduced-user)))
+       (l-error "em"))
+      ((not (and c (post-exists c)))
+       (l-error "ci"))
+      ((not tag-string)
+       (l-error "ej"))
+      (t
+       (sqlite:execute-non-query *mem-db* "delete from tags_to_posts where post_id=?" c)
+       (dolist (i (parse-tags (percent-decode tag-string)))
+         (sqlite:execute-non-query
+           *mem-db* "insert into tags_to_posts (post_id, tag_id) values (?, ?)"
+           c (tagname-to-id i *mem-db* :create-if-missing t)))
+       `(303 (:location ,(format nil "/id/~D" c))
+         nil))))))
+
+(defun page-post-comment (args)
+  (let* ((parsed (parse-simple (getf args :body)))
+         (path-s (getf args :path-s))
+         (post-id (parse-integer (or (second path-s) "") :junk-allowed t))
+         (user-id (second (getf args :deduced-user))))
+    (labels ((l-error (text)
+               (return-from page-post-comment
+                 (list 303 `(:content-type "text/plain"
+                             :location ,(format nil "/~{~A~^/~}?e=~A" (butlast path-s) text))))))
+      (unless post-id (l-error "ci"))
+      (unless (post-exists post-id) (l-error "ci"))
+      (unless user-id (l-error "cm"))
+      (sqlite:execute-non-query
+        *mem-db* "insert into comments (in_post, parent_comment, msg, user, date) values (?, -1, ?, ?, ?)"
+        (second path-s)
+        (percent-decode (gethash "comment" parsed "-the text was lost-"))
+        user-id
+        (get-universal-time))
+      (list 303 `(:content-type "text/plain"
+                  :location ,(format nil "/~{~A~^/~}" (butlast path-s)))))))
 
 (defun page-notfound (args)
   (list 404 '(:content-type "text/plain")
@@ -679,47 +806,68 @@
                       (getf args :path)
                       (getf args :meth)))))
 
-(defun route (meth path)
-  (cond
-    ((and (eql :get meth) (or (equal "/" path)
-                              (equal "" path)))
-     #'page-list-posts)
-    ((and (eql :get meth) (equal "/search" path))
-     #'page-search)
-    ((and (eql :get meth) (equal "/post" path))
-     #'page-post-form)
-    ((and (eql :get meth) (equal "/register" path))
-     #'page-register)
-    ((and (eql :get meth) (equal "/login" path))
-     #'page-login)
-    ((and (eql :get meth) (equal "/id" path))
-     #'page-id)
-    ((and (eql :post meth) (equal "/id" path))
-     #'page-post-create)
-    ((and (eql :post meth) (equal "/user" path))
-     #'page-post-user)
-    ((and (eql :post meth) (equal "/session" path))
-     #'page-post-session)
-    ((and (eql :post meth) (equal "/delete-session" path))
-     #'page-logout)
-    (t #'page-notfound)))
+(defun path-alike (path x)
+  (and (= (length path)
+          (length x))
+       (loop for i in path
+             for j in x
+             always (or (eq :any j)
+                        (equal i j)))))
+
+(defparameter *route-paths*
+  '((page-home         :get  nil)
+    (page-search       :get  ("search"))
+    (page-post-form    :get  ("post"))
+    (page-register     :get  ("register"))
+    (page-login        :get  ("login"))
+    (page-id           :get  ("id" :any))
+    (page-id-edit-tags :get  ("id" :any "edit-tags"))
+    (page-id-post-tags :post ("id" :any "edit-tags"))
+    (page-post-create  :post ("id"))
+    (page-post-user    :post ("user"))
+    (page-post-session :post ("session"))
+    (page-logout       :post ("delete-session"))
+    (page-post-comment :post ("id" :any "comment"))))
+
+(defun route (meth path-s)
+  (loop for i in *route-paths*
+        when (and (eql meth (second i))
+                  (path-alike path-s (third i)))
+          return (car i)
+        finally (return #'page-notfound)))
+
+(defun split-path (s)
+  (let ((r nil) (cpos 0))
+    (labels ((finish (pos)
+               (unless (= pos cpos)
+                 (setf r (cons (subseq s cpos pos) r)))))
+      (loop for i across s
+            for ix from 0
+            do (case i
+                 (#\/ (finish ix) (setf cpos (1+ ix)))
+                 (otherwise nil))
+            finally (progn
+                      (finish (length s))
+                      (return (nreverse r)))))))
 
 (defun page-entry (env)
   (let* ((path (getf env :path-info))
+         (path-s (split-path path))
          (query (getf env :query-string))
          (body (getf env :raw-body))
          (meth (getf env :request-method))
          (cookie (gethash "cookie" (getf env :headers)))
-         (cookie-parsed (parse-simple cookie)))
-    (funcall (route meth path)
+         (cookie-parsed (parse-simple cookie #\;)))
+    (funcall (route meth path-s)
              (list :query query
                    :body body
                    :cookie cookie-parsed
                    :query-parsed (parse-simple query)
                    :path path
+                   :path-s path-s
                    :meth meth
-                   :cookie-session (getf cookie-parsed :session)
-                   :deduced-user (get-cookie-user cookie-parsed)))))
+                   :cookie-session (gethash "session" cookie-parsed)
+                   :deduced-user (multiple-value-list (get-cookie-user cookie-parsed))))))
 
 (defvar *handler*
   (clack:clackup

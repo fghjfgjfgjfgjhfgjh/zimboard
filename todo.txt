@@ -1,5 +1,8 @@
-This was written for 12 days, part-time by someone not knowing any web
-development at all. A lot of things are buggy or unfinished. SQL statements
-are not finalized, causing memory leaks. In general, the code here is crappy,
-leaky, and probably has a remote code execution vulnerability. I intend to
-improve it later, but it's the first version that's under version control.
+Now that it's the second commit, it's much better but still lacks a lot of
+features. It is now, practically speaking, something in the "barely usable"
+category. Still lacks good tag search.
+
+'such hash already exists' but post still saved in list. In general, purge posts marked as unfinished.
++ Purging such posts is a separate step.
+
++ SQL statements are now finalized.
