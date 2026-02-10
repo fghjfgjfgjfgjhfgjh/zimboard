@@ -1,13 +1,5 @@
 (defpackage #:zimboard
-  (:use
-    #:cl
-    #:clack #:lack ;; TODO get rid of lack later. Maybe rewrite it to bare hunchentoot?
-    #:cl-who
-    #:sqlite
-    #:flexi-streams
-    #:md5
-    ; #:ironclad
-    #:magick-util))
+  (:use #:cl #:cl-who))
 
 (in-package #:zimboard)
 
@@ -30,6 +22,8 @@
     ("idx_tags_to_posts" . "create index idx_tags_to_posts on tags_to_posts (tag_id, post_id)")
     ("idx_posts_to_tags" . "create index idx_posts_to_tags on tags_to_posts (post_id, tag_id)")
     ("idx_comments_by_post" . "create index idx_comments_by_post on comments (in_post)")))
+
+(defvar *posts-per-page* 64)
 
 (defun table-exists-p (db name)
   (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
@@ -72,6 +66,7 @@
 (defun white-char-p (c)
   (or (eql c #\Tab)
       (eql c #\Newline)
+      (eql c #\Return)
       (eql c #\Space)))
 
 (defun int-to-hex (n)
@@ -219,6 +214,7 @@
   (let ((l (typecase request-body
              (null nil)
              (string request-body)
+             (array (flexi-streams:octets-to-string request-body))
              (t (read-line request-body nil)))))
     ;; NOTE that such a condition is redudant. (length nil) is zero
     (if (and l (not (zerop (length l))))
@@ -254,7 +250,7 @@
     `(list
        ,status '(:content-type "text/html")
        (list
-         (cl-who:with-html-output-to-string
+         (with-html-output-to-string
            (,output nil :prologue t)
            (:html
              (:head (:title ,title)
@@ -267,7 +263,7 @@
                 (cons :body body))))))))
 
 (defun page-error-div (output str)
-  (cl-who:with-html-output
+  (with-html-output
     (output)
     (:div :class "error"
           (:span (format output "~A" str)))))
@@ -294,7 +290,7 @@
         return (page-error-div output (cdr i))))
 
 (defun page-post-input (p)
-  (cl-who:with-html-output (p)
+  (with-html-output (p)
     (:form :method "post" :enctype "multipart/form-data" ;; any other kind won't let me have file transmission
            :action "/id"
       (:input :type "file" :name "image")
@@ -303,20 +299,20 @@
       (:input :type "submit" :value "Submit"))))
 
 (defun page-navbar (p &optional logged-as)
-  (cl-who:with-html-output
+  (with-html-output
     (p)
     (:nav :id "page-navbar"
           (:a :class "nav-link" :href "/" "Home")
           (:a :class "nav-link" :href "/search" "Search")
           (:a :class "nav-link" :href "/post" "Make a post")
           (if logged-as
-            (cl-who:with-html-output
+            (with-html-output
               (p)
               (:span :class "nav-span"
                      (format p "user/~A" logged-as))
               (:form :method "post" :action "/delete-session"
                      (:input :class "nav-button" :type "submit" :value "Log out")))
-            (cl-who:with-html-output
+            (with-html-output
               (p)
               (:a :class "nav-link" :href "/register" "Register")
               (:a :class "nav-link" :href "/login" "Login"))))))
@@ -461,9 +457,9 @@
                     *mem-db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
                     (tagname-to-id i *mem-db* :create-if-missing t) cur-id)))
           (sqlite:execute-non-query
-            *mem-db* "update posts set complete=1 where id=?" cur-id)))))
-  (list 303 '(:content-type "text/plain" :location "/")
-        '("sending image")))
+            *mem-db* "update posts set complete=1 where id=?" cur-id)
+          `(303 (:content-type "text/plain" :location ,(format nil "/id/~D" cur-id))
+            ("sending image")))))))
 
 (defun page-post-form (args)
   (simple-page
@@ -552,7 +548,7 @@
                    (sqlite:statement-column-value stmt 1)
                    (id-to-username (sqlite:statement-column-value stmt 1))
                    (print-date (sqlite:statement-column-value stmt 3))
-                   (cl-who:escape-string (sqlite:statement-column-value stmt 2)))
+                   (escape-string (sqlite:statement-column-value stmt 2)))
         finally (sqlite:finalize-statement stmt)))
 
 (defun page-display-post-preview (p post-id)
@@ -565,8 +561,11 @@
 (defun post-matches-tags-p (id x)
   (loop for i in x always (post-matches-tag-p id i)))
 
-(defun page-search-list (p s)
-  (let ((x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) (parse-search-query s))))
+(defun page-search-list (p s page)
+  ;; TODO make it start from either the top or the bottom
+  (let ((page-begin (* page *posts-per-page*))
+        (page-end (* (1+ page) *posts-per-page*))
+        (x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) (parse-search-query s))))
     (let ((ctag nil))
       (loop with ccount = 100000000
             for i in x do
@@ -574,28 +573,49 @@
               (when (< y ccount)
                 (setf ccount y
                       ctag i))))
-      (when ctag
-        (loop with stmt = (sqlite:prepare-statement *mem-db* "select posts.id from posts inner join tags_to_posts where tags_to_posts.post_id=posts.id and tags_to_posts.tag_id=? order by posts.creation_date desc")
-              initially (sqlite:bind-parameter stmt 1 ctag)
+      (if (or ctag (null x))
+        (loop with cur = 0
+              with stmt =
+              (if (null x)
+                (sqlite:prepare-statement *mem-db* "select id from posts order by creation_date desc")
+                (let ((stmt1 (sqlite:prepare-statement *mem-db* "select posts.id from posts inner join tags_to_posts where tags_to_posts.post_id=posts.id and tags_to_posts.tag_id=? order by posts.creation_date desc")))
+                  (sqlite:bind-parameter stmt1 1 ctag)
+                  stmt1))
+              ; while (< cur page-end)
               while (sqlite:step-statement stmt)
               when (post-matches-tags-p (sqlite:statement-column-value stmt 0) (cdr x))
-              do (page-display-post-preview p (sqlite:statement-column-value stmt 0))
-              finally (sqlite:finalize-statement stmt))))))
+              do (progn
+                   (when (<= page-begin cur (1- page-end))
+                     (page-display-post-preview p (sqlite:statement-column-value stmt 0)))
+                   (incf cur))
+              finally (progn
+                        (sqlite:finalize-statement stmt)
+                        (return cur)))
+        0))))
 
 (defun page-search (args)
-  (let ((s (gethash "s" (getf args :query-parsed) "")))
+  (let* ((qp (getf args :query-parsed))
+         (s (percent-decode (gethash "s" qp "")))
+         (page (or (parse-integer s :junk-allowed t)
+                   0))
+         (post-count nil))
     (simple-page
       (:title "Search" :args args :output output)
       (:form :action "/search"
              (:label :for "s" "Search string: ")
-             (:input :id "s" :name "s" :type "text" :placeholder "empty" :value s))
+             (:input :id "s" :name "s" :type "text" :placeholder "empty"
+                     :value (escape-string s)))
       (:div :id "post-list"
-            (if (not (zerop (length s)))
-              (page-search-list output s)
-              (loop with stmt = (sqlite:prepare-statement *mem-db* "select id from posts order by creation_date desc limit 10")
-                    while (sqlite:step-statement stmt)
-                    do (page-display-post-preview output (sqlite:statement-column-value stmt 0))
-                    finally (sqlite:finalize-statement stmt)))))))
+            (setf post-count (page-search-list output s page)))
+      (:ul
+        :class "page-list"
+        (unless (zerop page)
+          (with-html-output (output)
+            (:li (:a :href (format nil "/search?s=~A&p=~D" s (1- page)) "<-"))))
+        (loop for i from 0 to (floor (1- post-count) *posts-per-page*) do
+              (with-html-output (output)
+                (:li (:a :href (format nil "/search/?s=~A&p=~D" s i)
+                         (format output "[~D]" i)))))))))
 
 (defun valid-username-p (name)
   "Username is valid whenever it is at least 3 characters short and
@@ -697,7 +717,7 @@ consists only of Latin script, numerics, and any of [._-]"
          :location ,(or (gethash "goto" (parse-simple (getf args :query))) "/"))))
 
 (defun page-display-comment-form (p post-id)
-  (cl-who:with-html-output
+  (with-html-output
     (p)
     (:form :method "post" :action (format nil "/id/~D/comment" post-id)
            (:textarea :name "comment" :style "display: block"
@@ -715,17 +735,17 @@ consists only of Latin script, numerics, and any of [._-]"
      (cond
        ((and c (post-exists c))
         (page-display-post output c)
-        (cl-who:with-html-output (output)
-          (:a :class "nav-link" :href (format nil "/id/~D/edit-tags" c) "Edit tags"))
+        (with-html-output (output)
+          (:a :href (format nil "/id/~D/edit-tags" c) "Edit tags"))
         (format output "<div class=\"comments\">")
         (page-display-comments output c)
         (format output "</div>")
         (if (first (getf args :deduced-user))
             (page-display-comment-form output c)
-            (cl-who:with-html-output (output)
+            (with-html-output (output)
               (:p :class "note" "Only logged users can comment"))))
        (t
-        (cl-who:with-html-output (output)
+        (with-html-output (output)
           (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
 
 (defun page-id-edit-tags (args)
@@ -737,7 +757,7 @@ consists only of Latin script, numerics, and any of [._-]"
         ((and c (post-exists c))
          (page-display-post output c)
          (if (first (getf args :deduced-user))
-           (cl-who:with-html-output (output)
+           (with-html-output (output)
              (:form
                :method "post" :action (format nil "/id/~D/edit-tags" c)
                (:textarea
@@ -745,10 +765,10 @@ consists only of Latin script, numerics, and any of [._-]"
                  :style "display: block"
                  (format output "~{~A~^ ~}" (collect-post-tags c)))
                (:input :type "submit" :name "submit" :value "Edit tags")))
-           (cl-who:with-html-output (output)
+           (with-html-output (output)
              (:p :class "note" "Only logged users can edit post tags"))))
         (t
-         (cl-who:with-html-output (output)
+         (with-html-output (output)
            (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
 
 (defun page-id-post-tags (args)
@@ -800,17 +820,26 @@ consists only of Latin script, numerics, and any of [._-]"
       (list 303 `(:content-type "text/plain"
                   :location ,(format nil "/~{~A~^/~}" (butlast path-s)))))))
 
+(defun static-directory (args)
+  ;; TODO figure out a more safe/better way to serve files
+  (when (notany (lambda (x) (or (string= "." x)
+                                (string= ".." x)))
+                (getf args :path-s))
+    (pathname (format nil "./~{~A~^/~}" (getf args :path-s)))))
+
 (defun page-notfound (args)
   (list 404 '(:content-type "text/plain")
         (list (format nil "Requested page not found ~S ~A"
                       (getf args :path)
-                      (getf args :meth)))))
+                      (getf args :method)))))
 
 (defun path-alike (path x)
-  (and (= (length path)
-          (length x))
+  (and (or (= (length path)
+              (length x))
+           (eq :any* (car (last x))))
        (loop for i in path
              for j in x
+             until (eq :any* j)
              always (or (eq :any j)
                         (equal i j)))))
 
@@ -827,11 +856,13 @@ consists only of Latin script, numerics, and any of [._-]"
     (page-post-user    :post ("user"))
     (page-post-session :post ("session"))
     (page-logout       :post ("delete-session"))
-    (page-post-comment :post ("id" :any "comment"))))
+    (page-post-comment :post ("id" :any "comment"))
+    (static-directory  :get  ("static" :any*))
+    (static-directory  :get  ("imgs" :any*))))
 
-(defun route (meth path-s)
+(defun route (method path-s)
   (loop for i in *route-paths*
-        when (and (eql meth (second i))
+        when (and (eql method (second i))
                   (path-alike path-s (third i)))
           return (car i)
         finally (return #'page-notfound)))
@@ -855,24 +886,66 @@ consists only of Latin script, numerics, and any of [._-]"
          (path-s (split-path path))
          (query (getf env :query-string))
          (body (getf env :raw-body))
-         (meth (getf env :request-method))
-         (cookie (gethash "cookie" (getf env :headers)))
+         (method (getf env :request-method))
+         (cookie (cdr (assoc :cookie (getf env :headers))))
          (cookie-parsed (parse-simple cookie #\;)))
-    (funcall (route meth path-s)
+    (funcall (route method path-s)
              (list :query query
                    :body body
                    :cookie cookie-parsed
                    :query-parsed (parse-simple query)
                    :path path
                    :path-s path-s
-                   :meth meth
+                   :method method
                    :cookie-session (gethash "session" cookie-parsed)
                    :deduced-user (multiple-value-list (get-cookie-user cookie-parsed))))))
 
-(defvar *handler*
-  (clack:clackup
-    (lack:builder
-      (:static :path "/imgs/" :root #P"./imgs/")
-      (:static :path "/static/" :root #P"./static/")
-      (lambda (env) (funcall 'page-entry env)))
-    :port 8080))
+(defvar *acceptor* nil)
+
+(defclass my-acceptor (hunchentoot:acceptor)
+  ((access-log-destination :initform nil
+                           :accessor my-access-log-destination)
+   (message-log-destination :initform nil
+                            :accessor my-message-log-destination)))
+
+(defmethod hunchentoot:acceptor-log-access ((acceptor my-acceptor) &key return-code)
+  (declare (ignore return-code))
+  nil)
+
+;; NOTE that this would completely kill off the error logging
+; (defmethod hunchentoot:acceptor-log-message ((acceptor my-acceptor) log-level format-string &rest format-args)
+;   (declare (ignore log-level format-string format-args))
+;   nil)
+
+(defmethod hunchentoot:acceptor-dispatch-request ((acceptor my-acceptor) request)
+  (let* ((headers (hunchentoot:headers-in request))
+         (env (list :path-info (hunchentoot:script-name request)
+                    :query-string (hunchentoot:query-string request)
+                    :raw-body (hunchentoot:raw-post-data :request request
+                                                         :want-stream t)
+                    :request-method (hunchentoot:request-method request)
+                    :headers headers)))
+    (let ((response (page-entry env)))
+      (typecase response
+        (pathname
+         (hunchentoot:handle-static-file response))
+        (list
+         (destructuring-bind (status headers &optional content) response
+           (setf (hunchentoot:return-code*) status)
+           (setf (hunchentoot:content-type*) (getf headers :content-type))
+           ;; TODO figure out if cookies should be processed separately. The hunchentoot manual says so, but it still works(?)
+           (loop for (header-name header-value) on headers by #'cddr
+                 while header-name
+                 do (setf (hunchentoot:header-out header-name) header-value))
+           (car content)))))))
+
+(defun start-server ()
+  (when *acceptor*
+    (hunchentoot:stop *acceptor*))
+  (setf *acceptor* (hunchentoot:start (make-instance 'my-acceptor :port 8080))))
+
+(defun stop-server ()
+  (hunchentoot:stop *acceptor*))
+
+(unless *acceptor*
+  (start-server))

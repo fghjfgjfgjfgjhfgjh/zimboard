@@ -111,3 +111,12 @@ input:invalid {
 .article-preview a span {
 	margin: auto auto;
 }
+
+.page-list {
+	list-style: none;
+}
+
+.page-list li {
+	display: inline;
+	margin: 0 5px;
+}

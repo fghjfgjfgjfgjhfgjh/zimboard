@@ -12,13 +12,6 @@
 
 ; TODO run zi_init and zi_uninit where appropriate
 
-; (defmacro with-read-image (head body)
-;   (destructuring-bind (name buf) head
-;     `(let ((,name (create-wand ,buf)))
-;        (unwind-protect
-;          (progn ,body)
-;          (destroy-wand ,name)))))
-
 (defun make-clean-blob (buf)
   (declare (type (simple-array (unsigned-byte 8)) buf))
   (cffi:with-foreign-objects

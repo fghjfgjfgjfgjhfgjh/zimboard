@@ -3,7 +3,6 @@
   :author "Dmytry Strakhal"
   :license "BSD 2-Clause"
   :depends-on (#:hunchentoot
-               #:clack #:lack #:clack-handler-hunchentoot
                #:trivial-mimes
                #:trivial-rfc-1123
                #:cl-who #:sqlite #:flexi-streams #:md5 #:zimboard/magick-util)
