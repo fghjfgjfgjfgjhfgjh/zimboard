@@ -1,0 +1,105 @@
+The *draft* of the API/HTML specification.
+
+Short description on paths that must be possible to access.
+
+Home: "/".
+Can be anything but it is recommended to provide navigation links,
+such as Search, Register, Login, etc.
+
+Search: "/search".
+Can be used to query the server about posts matching specific tags. The query
+string may contain a s=<string> field, identifying tags that should be checked,
+separated by whitespace characters or commas. All the posts whose tagset is a
+superset of specified tags must be shown in the resulting HTML. The output may
+be paginated, and if so, the p=<number> request parameter describes the current
+viewed page. If it is absent, the first page is to be shown.
+
+Post form: "/post".
+Shall provide a form, through which the user can send an image to the server.
+When the form is filled out, the 'submit' action should execute a request,
+which would send the image and tags data to the server. Then, the server must
+redirect the client to the newly created post. If the post wasn't created, the
+server should redirect the client back to "/post", providing an explanation to
+the refusal. The implementation is free to decide who can post. It is heavily
+suggested to only allow registered users to post. The server must accept tags
+data whenever it is ASCII printable characters and whitespace. For separating
+tags, the string may be simply split by whitespace and commas. Non-ASCII
+characters *may* be supported, but it's not a requirement.
+
+Register form: "/register".
+Shall provide a form, through which the user can ask the server to add a new
+user record. Any user validation method (including absence of any) is allowed.
+It is suggested to have a manual user validation queue implemented. The form
+must provide a way to enter an username and a password, which are to be sent to
+the server. It also is suggested to have some kind of robot check to avoid
+receiving spam registration requests.
+
+Login form: "/login".
+Shall provide a form, through which the user can identify himself to the
+server, providing a nickname and a password. The server shall, on submission,
+supply the client with a cookie identifying the ongoing user login session.
+
+Page by id: "/id/<number>".
+Shall show some information about the post identified by <number>, including,
+but not limited to: creation date, post tags and user. Most importantly, show
+the post image.
+
+Page by id/edit tags: "/id/<number>/edit-tags".
+Shall provide a form, through which the user is able to submit a request to
+change the tagset of the post identified by <number>.
+
+Comment: "<unspecified>", method POST.
+Can be accessible from the "Page by id" via a form. It is suggested that only
+registered users can comment. An implementation may be free to reject any
+comment whenever it likes (for example, for being too long). It is optional to
+explain the reason in the redirect destination page. The comments should be
+displayed on the "Page id", and may be paginated.
+
+(TODO tree-style comments spec)
+
+Logout: "<unspecified>", method POST.
+Such a request shall mark the current user session invalid, effectively logging
+the session user out. Optionally, reset the cookie on the client.
+
+Suggested database description.
+
+It's preferable to use an SQL database.
+In such case, it must include the following tables:
+
+"users".
+Must contain: id (integer, primary key), name (text), passwd (text).
+Note: passwd does not have the actual password text, but rather the SHA256 hash
+of such. If you don't care about security, you are free to use MD5 instead of
+SHA256.
+
+"sessions".
+Must contain: id (text, primary key), expiration (integer, UNIX time), user_id (integer, user ID).
+
+"posts".
+Must contain: id (integer, primary key), md5 (text), complete (integer), creation_date (integer, UNIX time), posted_by (integer, user ID).
+"md5" shall contain the MD5 hash of the post. "complete" shall signify
+whether the post is valid or not. Zero means incompleteness, any other number
+means otherwise. (I am still unsure of usefulness of this field, may be better
+done with sql transactions). If the "complete" field is zero, that means the
+post creation procedure failed and the implementation is free to purge files
+associated with this post, the only exception being a hash collision between
+posts (It's quite unlikely), in which case the implementation must not delete
+the file associated with a different post.
+
+"tags".
+Must contain: id (integer, primary key), name (text).
+
+"tags_to_posts".
+Must contain: tag_id (integer), post_id (integer).
+Describes that "post_id" has the "tag_id" tag.
+
+"cache_entries": id (integer, primary key), last_used (integer, UNIX time).
+"cache_tags": cache_id (integer), tag_id (integer).
+The tables for caching search queries. In case a search query contains at
+least two tags, a cached query must be used. Cache entries should be updated
+whenever a post is created or tags are changed to fit the current post
+information. Whenever the implementation likes it, cached queries may be
+deleted in order to reduce the work done to keep the caches valid whenever
+posts get edited/added.
+
+Recommended table indexing strategy: see zimboard/main.lisp: (defvar *table-indices* ...).

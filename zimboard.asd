@@ -15,6 +15,7 @@
   :license "BSD 2-Clause"
   :depends-on (#:cffi)
   :around-compile (lambda (next &rest args &key &allow-other-keys)
+                    ;; TODO make this portable and not run on every load
                     (uiop:run-program 
                       "gcc -fPIC -shared -Wall -Wextra -O2 `pkg-config --cflags --libs ImageMagick MagickWand` -o magick_util.so magick_util.c"
                       :output t
